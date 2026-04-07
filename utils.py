@@ -46,6 +46,7 @@ APP_STORE_LOCALES = {
     "ro": "Romanian",
     "ru": "Russian",
     "sk": "Slovak",
+    "sl-SI": "Slovenian",
     "es-MX": "Spanish (Mexico)",
     "es-ES": "Spanish (Spain)",
     "sv": "Swedish",

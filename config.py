@@ -44,10 +44,51 @@ class ConfigManager:
         
         if not self.saved_apps_file.exists():
             self._create_default_saved_apps()
-    
-    def _create_default_providers(self):
-        """Create default providers configuration."""
-        default_providers = {
+
+        self._migrate_config_files()
+
+    def _merge_missing_values(self, existing: Dict[str, Any], defaults: Dict[str, Any]) -> bool:
+        """Merge missing keys from defaults into existing config."""
+        changed = False
+        for key, value in defaults.items():
+            if key not in existing:
+                existing[key] = value
+                changed = True
+                continue
+
+            if isinstance(value, dict) and isinstance(existing.get(key), dict):
+                if self._merge_missing_values(existing[key], value):
+                    changed = True
+
+        return changed
+
+    def _migrate_config_files(self):
+        """Backfill new config keys for existing installations."""
+        try:
+            with open(self.providers_file, "r") as f:
+                providers = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            providers = {}
+
+        default_providers = self._default_providers_config()
+        if self._merge_missing_values(providers, default_providers):
+            with open(self.providers_file, "w") as f:
+                json.dump(providers, f, indent=2)
+
+        try:
+            with open(self.api_keys_file, "r") as f:
+                api_keys = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            api_keys = {}
+
+        default_api_keys = self._default_api_keys_config()
+        if self._merge_missing_values(api_keys, default_api_keys):
+            with open(self.api_keys_file, "w") as f:
+                json.dump(api_keys, f, indent=2)
+
+    def _default_providers_config(self) -> Dict[str, Any]:
+        """Return default providers configuration."""
+        return {
             "default_provider": "",
             "prompt_refinement": "",
             "anthropic": {
@@ -68,7 +109,7 @@ class ConfigManager:
             },
             "openai": {
                 "name": "OpenAI GPT",
-                "class": "OpenAIProvider", 
+                "class": "OpenAIProvider",
                 "models": [
                     "gpt-5.2",
                     "gpt-5.1",
@@ -77,7 +118,7 @@ class ConfigManager:
                     "gpt-5-mini",
                     "gpt-5-mini-2025-08-07",
                     "gpt-5-nano",
-                    "gpt-5-nano-2025-08-07",
+                    "gpt-5-nano-2025-08-07"
                 ],
                 "default_model": "gpt-5.2"
             },
@@ -121,15 +162,23 @@ class ConfigManager:
                     "x-ai/grok-code-fast-1"
                 ],
                 "default_model": "google/gemini-3.1-pro-preview"
+            },
+            "local": {
+                "name": "Local Model",
+                "class": "LocalModelProvider",
+                "enabled": False,
+                "base_url": "http://127.0.0.1:8080",
+                "models": [],
+                "default_model": "gemma4",
+                "max_output_tokens": 8000
             }
         }
-        
-        with open(self.providers_file, "w") as f:
-            json.dump(default_providers, f, indent=2)
-    
-    def _create_default_api_keys(self):
-        """Create default API keys template."""
-        default_keys = {
+
+    def _default_api_keys_config(self) -> Dict[str, Any]:
+        """Return default API keys configuration."""
+        # Keep provider secrets separate from provider metadata so migrations can
+        # backfill either file independently without rewriting user settings.
+        return {
             "app_store_connect": {
                 "key_id": "",
                 "issuer_id": "",
@@ -139,9 +188,21 @@ class ConfigManager:
                 "anthropic": "",
                 "openai": "",
                 "google": "",
-                "openrouter": ""
+                "openrouter": "",
+                "local": ""
             }
         }
+
+    def _create_default_providers(self):
+        """Create default providers configuration."""
+        default_providers = self._default_providers_config()
+        
+        with open(self.providers_file, "w") as f:
+            json.dump(default_providers, f, indent=2)
+    
+    def _create_default_api_keys(self):
+        """Create default API keys template."""
+        default_keys = self._default_api_keys_config()
         
         with open(self.api_keys_file, "w") as f:
             json.dump(default_keys, f, indent=2)
@@ -259,6 +320,12 @@ CRITICAL: If you cannot stay within character limits while preserving meaning, p
         """Get API key for specific AI provider."""
         api_keys = self.load_api_keys()
         return api_keys.get("ai_providers", {}).get(provider)
+
+    def get_provider_settings(self, provider_name: str) -> Dict[str, Any]:
+        """Return provider settings from providers.json."""
+        cfg = self.load_providers()
+        provider = cfg.get(provider_name)
+        return provider if isinstance(provider, dict) else {}
 
     def get_default_ai_provider(self) -> Optional[str]:
         """Return configured default provider name, if any."""

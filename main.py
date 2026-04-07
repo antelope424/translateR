@@ -12,13 +12,21 @@ Repository: https://github.com/emreertunc/translater
 
 import sys
 import os
+import re
 import time
 import subprocess
 from typing import Optional, Dict, Any, List
 
 from config import ConfigManager
 from app_store_client import AppStoreConnectClient
-from ai_providers import AIProviderManager, AnthropicProvider, OpenAIProvider, GoogleGeminiProvider, OpenRouterProvider
+from ai_providers import (
+    AIProviderManager,
+    AnthropicProvider,
+    GoogleGeminiProvider,
+    LocalModelProvider,
+    OpenRouterProvider,
+    OpenAIProvider,
+)
 from ui import UI
 from workflows.iap_translate import run as iap_translate_run
 from workflows.subscription_translate import run as subscription_translate_run
@@ -36,6 +44,11 @@ from utils import (
 class TranslateRCLI:
     """Main CLI interface for TranslateR application."""
     DEFAULT_REPO_URL = "https://github.com/emreertunc/translateR"
+    LOCAL_DEFAULT_MAX_OUTPUT_TOKENS = 8000
+    LOCAL_LONG_TEXT_FIELDS = {"description", "whats_new"}
+    LOCAL_CHUNK_THRESHOLD = 2400
+    LOCAL_PREFERRED_CHUNK_SIZE = 1400
+    LOCAL_HARD_CHUNK_SIZE = 1800
     
     def __init__(self):
         self.config = ConfigManager()
@@ -47,6 +60,7 @@ class TranslateRCLI:
     def setup_ai_providers(self):
         """Initialize AI providers from configuration."""
         try:
+            self.ai_manager = AIProviderManager()
             providers_config = self.config.load_providers()
             
             # Setup Anthropic
@@ -76,9 +90,51 @@ class TranslateRCLI:
                 default_model = providers_config.get("openrouter", {}).get("default_model", "google/gemini-3.1-pro-preview")
                 openrouter = OpenRouterProvider(openrouter_key, default_model)
                 self.ai_manager.add_provider("openrouter", openrouter)
+
+            local_config = self.config.get_provider_settings("local")
+            if local_config.get("enabled"):
+                local_model = str(local_config.get("default_model", "") or "").strip()
+                local_base_url = str(local_config.get("base_url", "") or "").strip()
+                local_max_output_tokens = self._coerce_positive_int(
+                    local_config.get("max_output_tokens"),
+                    self.LOCAL_DEFAULT_MAX_OUTPUT_TOKENS,
+                )
+                local_api_key = self.config.get_ai_provider_key("local")
+                if local_model and local_base_url:
+                    local_provider = LocalModelProvider(
+                        model=local_model,
+                        base_url=local_base_url,
+                        api_key=local_api_key,
+                        max_output_tokens=local_max_output_tokens,
+                    )
+                    self.ai_manager.add_provider("local", local_provider)
                 
         except Exception as e:
             print_error(f"Error setting up AI providers: {e}")
+
+    def _has_configured_ai_provider(self, api_keys: Dict[str, Any], providers_config: Dict[str, Any]) -> bool:
+        """Return True if any remote or local AI provider is configured."""
+        remote_keys = api_keys.get("ai_providers", {})
+        # OpenRouter is API-key based like the other hosted providers, so it must
+        # participate in the same "at least one provider configured" check.
+        if any(remote_keys.get(name) for name in ("anthropic", "openai", "google", "openrouter")):
+            return True
+
+        local_config = providers_config.get("local", {})
+        return bool(
+            local_config.get("enabled")
+            and str(local_config.get("default_model", "") or "").strip()
+            and str(local_config.get("base_url", "") or "").strip()
+        )
+
+    @staticmethod
+    def _coerce_positive_int(value: Any, default: int) -> int:
+        """Return a positive integer config value or the provided default."""
+        try:
+            parsed = int(str(value).strip())
+        except (TypeError, ValueError, AttributeError):
+            return default
+        return parsed if parsed > 0 else default
     
     def setup_app_store_client(self):
         """Initialize App Store Connect client."""
@@ -132,6 +188,7 @@ class TranslateRCLI:
         
         # Save App Store Connect config
         api_keys = self.config.load_api_keys()
+        providers_config = self.config.load_providers()
         api_keys["app_store_connect"] = {
             "key_id": key_id,
             "issuer_id": issuer_id,
@@ -143,12 +200,13 @@ class TranslateRCLI:
         print("Configure at least one AI provider for translations:")
         
         # AI providers setup
-        providers = ["anthropic", "openai", "google", "openrouter"]
+        providers = ["anthropic", "openai", "google", "openrouter", "local"]
         provider_names = {
             "anthropic": "Anthropic Claude",
-            "openai": "OpenAI GPT", 
+            "openai": "OpenAI GPT",
             "google": "Google Gemini",
-            "openrouter": "OpenRouter"
+            "openrouter": "OpenRouter",
+            "local": "Local Model"
         }
         
         print("\nAvailable models for each provider:")
@@ -161,17 +219,48 @@ class TranslateRCLI:
                 if provider == "openrouter":
                     print("\n  OpenRouter provides access to many AI models via a unified API.")
                     print("  Get your API key from: https://openrouter.ai/settings")
-                api_key = input(f"Enter {provider_names[provider]} API key: ").strip()
-                if api_key:
-                    api_keys["ai_providers"][provider] = api_key
+                if provider == "local":
+                    # Local models need endpoint/model details instead of the generic
+                    # remote-provider API-key prompt used by hosted services.
+                    existing_local = providers_config.get("local", {})
+                    base_url_default = existing_local.get("base_url", "http://localhost:8080")
+                    model_default = existing_local.get("default_model", "gemma4")
+                    max_tokens_default = self._coerce_positive_int(
+                        existing_local.get("max_output_tokens"),
+                        self.LOCAL_DEFAULT_MAX_OUTPUT_TOKENS,
+                    )
+
+                    print("Local provider expects an OpenAI-compatible endpoint such as Ollama, LM Studio, or llama.cpp server mode.")
+                    base_url = input(f"Enter local base URL [{base_url_default}]: ").strip() or str(base_url_default)
+                    model = input(f"Enter local model name [{model_default}]: ").strip() or str(model_default)
+                    max_tokens_input = input(
+                        f"Enter local max output tokens [{max_tokens_default}]: "
+                    ).strip()
+                    api_key = input("Enter local API key if required (leave blank otherwise): ").strip()
+                    max_output_tokens = self._coerce_positive_int(max_tokens_input, max_tokens_default)
+
+                    providers_config.setdefault("local", {})
+                    providers_config["local"]["enabled"] = True
+                    providers_config["local"]["base_url"] = base_url
+                    providers_config["local"]["default_model"] = model
+                    providers_config["local"]["max_output_tokens"] = max_output_tokens
+                    api_keys["ai_providers"]["local"] = api_key
+                else:
+                    api_key = input(f"Enter {provider_names[provider]} API key: ").strip()
+                    if api_key:
+                        api_keys["ai_providers"][provider] = api_key
+            elif provider == "local":
+                providers_config.setdefault("local", {})
+                providers_config["local"]["enabled"] = False
         
         # Check if at least one AI provider is configured
-        if not any(api_keys["ai_providers"].values()):
-            print_error("You must configure at least one AI provider!")
+        if not self._has_configured_ai_provider(api_keys, providers_config):
+            print_error("You must configure at least one AI provider or local model!")
             return False
         
         # Save configuration
         self.config.save_api_keys(api_keys)
+        self.config.save_providers(providers_config)
         print_success("Configuration saved successfully!")
         
         # Reinitialize clients
@@ -566,6 +655,444 @@ class TranslateRCLI:
             except ValueError:
                 print_error("Please enter a number")
 
+    def _switch_default_ai_provider(self) -> None:
+        """Allow user to change or clear the default AI provider."""
+        providers = self.ai_manager.list_providers()
+        if not providers:
+            print_error("No AI providers configured. Please run setup first.")
+            return
+
+        current_default = self.config.get_default_ai_provider()
+
+        print()
+        print("Default AI provider:")
+        print(f"Current: {current_default or 'None'}")
+        print()
+        print("Available AI providers:")
+        for i, provider in enumerate(providers, 1):
+            suffix = " (current default)" if provider == current_default else ""
+            print(f"{i}. {provider}{suffix}")
+        print(f"{len(providers) + 1}. Clear default provider")
+
+        while True:
+            raw = input(f"Select option (1-{len(providers) + 1}): ").strip()
+            try:
+                choice = int(raw)
+            except ValueError:
+                print_error("Please enter a number")
+                continue
+
+            if 1 <= choice <= len(providers):
+                selected_provider = providers[choice - 1]
+                self.config.set_default_ai_provider(selected_provider)
+                print_success(f"Default AI provider set to: {selected_provider}")
+                return
+
+            if choice == len(providers) + 1:
+                self.config.set_default_ai_provider(None)
+                print_success("Default AI provider cleared")
+                return
+
+            print_error("Invalid choice")
+
+    def _configure_remote_ai_provider(
+        self,
+        provider: str,
+        display_name: str,
+        api_keys: Dict[str, Any],
+    ) -> None:
+        """Configure API-key based AI providers."""
+        provider_keys = api_keys.setdefault("ai_providers", {})
+        current_value = str(provider_keys.get(provider, "") or "")
+        status = "configured" if current_value else "not configured"
+
+        print()
+        print(f"{display_name}")
+        print(f"Current status: {status}")
+        print("Enter a new API key, leave blank to keep current, or type 'clear' to remove it.")
+        value = input("API key: ").strip()
+
+        if not value:
+            print_info("No changes made")
+            return
+
+        if value.lower() == "clear":
+            provider_keys[provider] = ""
+            print_success(f"{display_name} cleared")
+            return
+
+        provider_keys[provider] = value
+        print_success(f"{display_name} updated")
+
+    def _configure_local_ai_provider(
+        self,
+        api_keys: Dict[str, Any],
+        providers_config: Dict[str, Any],
+    ) -> None:
+        """Configure local OpenAI-compatible provider settings."""
+        local_config = providers_config.setdefault("local", {})
+        current_enabled = bool(local_config.get("enabled"))
+        current_base_url = str(local_config.get("base_url", "http://localhost:8080") or "http://localhost:8080")
+        current_model = str(local_config.get("default_model", "gemma4") or "gemma4")
+        current_max_tokens = self._coerce_positive_int(
+            local_config.get("max_output_tokens"),
+            self.LOCAL_DEFAULT_MAX_OUTPUT_TOKENS,
+        )
+        provider_keys = api_keys.setdefault("ai_providers", {})
+        current_api_key = str(provider_keys.get("local", "") or "")
+
+        print()
+        print("Local Model")
+        print(f"Current status: {'enabled' if current_enabled else 'disabled'}")
+        print(f"Current base URL: {current_base_url}")
+        print(f"Current model: {current_model}")
+        print(f"Current max output tokens: {current_max_tokens}")
+        print("This provider expects an OpenAI-compatible endpoint such as Ollama, LM Studio, or llama.cpp server mode.")
+
+        enable = input("Enable local provider? (y/n): ").strip().lower()
+        if enable not in ["y", "yes"]:
+            local_config["enabled"] = False
+            print_success("Local provider disabled")
+            return
+
+        base_url = input(f"Enter local base URL [{current_base_url}]: ").strip() or current_base_url
+        model = input(f"Enter local model name [{current_model}]: ").strip() or current_model
+        max_tokens_input = input(
+            f"Enter local max output tokens [{current_max_tokens}]: "
+        ).strip()
+        print("Enter API key if required, leave blank to keep current, or type 'clear' to remove it.")
+        api_key = input("Local API key: ").strip()
+        max_output_tokens = self._coerce_positive_int(max_tokens_input, current_max_tokens)
+
+        local_config["enabled"] = True
+        local_config["base_url"] = base_url
+        local_config["default_model"] = model
+        local_config["max_output_tokens"] = max_output_tokens
+
+        if api_key.lower() == "clear":
+            provider_keys["local"] = ""
+        elif api_key:
+            provider_keys["local"] = api_key
+        elif "local" not in provider_keys:
+            provider_keys["local"] = current_api_key
+
+        print_success("Local provider updated")
+
+    def _configure_ai_providers_menu(self) -> None:
+        """Configure AI providers without rerunning full setup."""
+        # Keep this list in sync with setup_wizard() and setup_ai_providers() so
+        # every supported runtime provider remains configurable after first run.
+        provider_names = {
+            "anthropic": "Anthropic Claude",
+            "openai": "OpenAI GPT",
+            "google": "Google Gemini",
+            "openrouter": "OpenRouter",
+            "local": "Local Model",
+        }
+
+        while True:
+            api_keys = self.config.load_api_keys()
+            providers_config = self.config.load_providers()
+
+            print()
+            print("AI Provider Configuration:")
+            for i, provider in enumerate(provider_names.keys(), 1):
+                if provider == "local":
+                    enabled = bool(providers_config.get("local", {}).get("enabled"))
+                    status = "enabled" if enabled else "disabled"
+                else:
+                    configured = bool(api_keys.get("ai_providers", {}).get(provider))
+                    status = "configured" if configured else "not configured"
+                print(f"{i}. {provider_names[provider]} [{status}]")
+            print("6. Back")
+
+            choice = input("Select provider to configure (1-6): ").strip()
+            if choice == "1":
+                self._configure_remote_ai_provider("anthropic", provider_names["anthropic"], api_keys)
+            elif choice == "2":
+                self._configure_remote_ai_provider("openai", provider_names["openai"], api_keys)
+            elif choice == "3":
+                self._configure_remote_ai_provider("google", provider_names["google"], api_keys)
+            elif choice == "4":
+                self._configure_remote_ai_provider("openrouter", provider_names["openrouter"], api_keys)
+            elif choice == "5":
+                self._configure_local_ai_provider(api_keys, providers_config)
+            elif choice == "6":
+                return
+            else:
+                print_error("Invalid choice")
+                continue
+
+            self.config.save_api_keys(api_keys)
+            self.config.save_providers(providers_config)
+            self.setup_ai_providers()
+
+    def _get_translation_refinement(self, field_key: str, chunk_label: Optional[str] = None) -> Optional[str]:
+        """Build field-aware refinement guidance for translation requests."""
+        refinements: List[str] = []
+        saved_refinement = (self.config.get_prompt_refinement() or "").strip()
+        if saved_refinement:
+            refinements.append(saved_refinement)
+
+        if field_key in self.LOCAL_LONG_TEXT_FIELDS:
+            refinements.append(
+                "Translate the complete text faithfully. Do not summarize, omit sections, or "
+                "compress the content into a shorter overview. Preserve paragraph breaks, "
+                "bullet structure, and headings when possible."
+            )
+
+        if chunk_label:
+            refinements.append(
+                f"This is {chunk_label} from a longer App Store {field_key.replace('_', ' ')}. "
+                f"Translate the entire segment completely and keep terminology consistent."
+            )
+
+        return " ".join(refinements).strip() or None
+
+    @staticmethod
+    def _split_text_into_units(text: str, delimiter_pattern: str) -> List[str]:
+        """Split text while attaching delimiters to the preceding unit."""
+        parts = re.split(f"({delimiter_pattern})", text)
+        units: List[str] = []
+        current = ""
+
+        for part in parts:
+            if not part:
+                continue
+            if re.fullmatch(delimiter_pattern, part):
+                current += part
+            else:
+                if current:
+                    units.append(current)
+                current = part
+
+        if current:
+            units.append(current)
+
+        return units
+
+    def _split_oversized_translation_unit(self, text: str) -> List[str]:
+        """Break an oversized text unit into smaller translation-safe chunks."""
+        split_patterns = [
+            r"\n",
+            r"(?<=[.!?])\s+",
+            r"\s+",
+        ]
+
+        for pattern in split_patterns:
+            units = self._split_text_into_units(text, pattern)
+            if len(units) > 1:
+                packed = self._pack_translation_units(units)
+                if len(packed) > 1 or packed[0] != text:
+                    return packed
+
+        return [
+            text[i:i + self.LOCAL_HARD_CHUNK_SIZE]
+            for i in range(0, len(text), self.LOCAL_HARD_CHUNK_SIZE)
+        ]
+
+    def _pack_translation_units(self, units: List[str]) -> List[str]:
+        """Pack text units into chunks near the preferred size."""
+        chunks: List[str] = []
+        current = ""
+
+        for unit in units:
+            if not unit:
+                continue
+
+            if len(unit) > self.LOCAL_HARD_CHUNK_SIZE:
+                if current:
+                    chunks.append(current)
+                    current = ""
+                chunks.extend(self._split_oversized_translation_unit(unit))
+                continue
+
+            if current and len(current) + len(unit) > self.LOCAL_PREFERRED_CHUNK_SIZE:
+                chunks.append(current)
+                current = unit
+            else:
+                current += unit
+
+        if current:
+            chunks.append(current)
+
+        return chunks
+
+    def _chunk_text_for_translation(self, text: str) -> List[str]:
+        """Split long-form text into chunks while preserving structure."""
+        if len(text) <= self.LOCAL_HARD_CHUNK_SIZE:
+            return [text]
+
+        units = self._split_text_into_units(text, r"\n\s*\n")
+        if len(units) <= 1:
+            units = self._split_text_into_units(text, r"\n")
+        if len(units) <= 1:
+            units = [text]
+
+        chunks = self._pack_translation_units(units)
+        return chunks if chunks else [text]
+
+    def _should_chunk_local_translation(
+        self,
+        provider: Any,
+        field_key: str,
+        source_content: str,
+    ) -> bool:
+        """Return True when long local translations should be chunked proactively."""
+        return (
+            isinstance(provider, LocalModelProvider)
+            and field_key in self.LOCAL_LONG_TEXT_FIELDS
+            and len(source_content) > self.LOCAL_CHUNK_THRESHOLD
+        )
+
+    def _should_retry_chunked_translation(
+        self,
+        provider: Any,
+        field_key: str,
+        source_content: str,
+        error_message: str,
+    ) -> bool:
+        """Return True when a local long-field translation should retry in chunks."""
+        message = (error_message or "").lower()
+        return (
+            isinstance(provider, LocalModelProvider)
+            and field_key in self.LOCAL_LONG_TEXT_FIELDS
+            and len(source_content) > self.LOCAL_PREFERRED_CHUNK_SIZE
+            and any(marker in message for marker in ("truncated", "max output tokens", "max_tokens"))
+        )
+
+    def _translate_long_field_in_chunks(
+        self,
+        provider: Any,
+        source_content: str,
+        language_name: str,
+        field_key: str,
+    ) -> str:
+        """Translate long-form metadata in chunks for local-model stability."""
+        max_length = get_field_limit(field_key)
+        chunks = self._chunk_text_for_translation(source_content)
+        if len(chunks) <= 1:
+            return provider.translate(
+                source_content,
+                language_name,
+                max_length=max_length,
+                refinement=self._get_translation_refinement(field_key),
+            )
+
+        print_info(
+            f"    Using chunked translation for {field_key.replace('_', ' ')} "
+            f"({len(chunks)} chunks)"
+        )
+
+        translated_chunks: List[str] = []
+        remaining_source = sum(len(chunk) for chunk in chunks)
+        remaining_budget = max_length
+
+        for index, chunk in enumerate(chunks, 1):
+            if remaining_budget is not None and remaining_budget <= 0:
+                raise ValueError(
+                    f"No character budget left while chunk-translating {field_key.replace('_', ' ')}"
+                )
+
+            leading_whitespace_match = re.match(r"^\s+", chunk)
+            trailing_whitespace_match = re.search(r"\s+$", chunk)
+            leading_whitespace = leading_whitespace_match.group(0) if leading_whitespace_match else ""
+            trailing_whitespace = trailing_whitespace_match.group(0) if trailing_whitespace_match else ""
+            chunk_text = chunk.strip()
+            if not chunk_text:
+                translated_chunks.append(chunk)
+                remaining_source -= len(chunk)
+                if remaining_budget is not None:
+                    remaining_budget -= len(chunk)
+                continue
+
+            if max_length:
+                remaining_chunks = len(chunks) - index
+                if index == len(chunks):
+                    chunk_limit = remaining_budget
+                else:
+                    proportional_limit = round((remaining_budget * len(chunk)) / max(1, remaining_source))
+                    chunk_limit = max(1, min(proportional_limit, remaining_budget - remaining_chunks))
+                chunk_limit -= len(leading_whitespace) + len(trailing_whitespace)
+                if chunk_limit <= 0:
+                    raise ValueError(
+                        f"Chunk budget became too small while translating {field_key.replace('_', ' ')}"
+                    )
+            else:
+                chunk_limit = None
+
+            translated_chunk = provider.translate(
+                chunk_text,
+                language_name,
+                max_length=chunk_limit,
+                refinement=self._get_translation_refinement(
+                    field_key,
+                    chunk_label=f"segment {index} of {len(chunks)}",
+                ),
+            )
+            translated_chunks.append(f"{leading_whitespace}{translated_chunk}{trailing_whitespace}")
+            remaining_source -= len(chunk)
+            if remaining_budget is not None:
+                remaining_budget -= len(translated_chunks[-1])
+
+        translated_content = "".join(translated_chunks).strip()
+
+        if max_length and len(translated_content) > max_length:
+            print_warning(
+                f"Chunked translation for {field_key.replace('_', ' ')} exceeded the "
+                f"{max_length}-character limit; truncating to fit."
+            )
+            translated_content = translated_content[:max_length].rstrip()
+
+        return translated_content
+
+    def _translate_field_content(
+        self,
+        provider: Any,
+        source_content: str,
+        language_name: str,
+        field_key: str,
+        is_keywords: bool = False,
+    ) -> str:
+        """Translate a field with local-model safeguards for long content."""
+        max_length = get_field_limit(field_key)
+        refinement = self._get_translation_refinement(field_key)
+
+        if self._should_chunk_local_translation(provider, field_key, source_content):
+            return self._translate_long_field_in_chunks(
+                provider,
+                source_content,
+                language_name,
+                field_key,
+            )
+
+        try:
+            return provider.translate(
+                source_content,
+                language_name,
+                max_length=max_length,
+                is_keywords=is_keywords,
+                refinement=refinement,
+            )
+        except Exception as exc:
+            if self._should_retry_chunked_translation(
+                provider,
+                field_key,
+                source_content,
+                str(exc),
+            ):
+                print_warning(
+                    f"    Local model output was truncated for {field_key.replace('_', ' ')}; "
+                    f"retrying in chunks"
+                )
+                return self._translate_long_field_in_chunks(
+                    provider,
+                    source_content,
+                    language_name,
+                    field_key,
+                )
+            raise
+
     def _is_provider_error(self, error_message: str) -> bool:
         """Detect whether an error likely came from AI provider APIs."""
         message = (error_message or "").lower()
@@ -574,6 +1101,7 @@ class TranslateRCLI:
             "anthropic",
             "openai",
             "google gemini",
+            "local model",
             "api key",
             "credit balance",
             "quota",
@@ -665,6 +1193,54 @@ class TranslateRCLI:
                 return
             else:
                 print_error("Invalid choice. Please select 1-4.")
+
+    def _metadata_field_mapping(self, base_data: Dict[str, Any]) -> Dict[str, tuple]:
+        """Return metadata field definitions from base localization data."""
+        return {
+            "description": ("Description", base_data.get("description"), "description"),
+            "keywords": ("Keywords", base_data.get("keywords"), "keywords"),
+            "promotional_text": ("Promotional Text", base_data.get("promotionalText"), "promotional_text"),
+            "whats_new": ("What's New", base_data.get("whatsNew"), "whats_new"),
+        }
+
+    def _select_metadata_fields(self, base_data: Dict[str, Any], action_label: str = "translate") -> Optional[List[str]]:
+        """Prompt user to select which metadata fields to process."""
+        print()
+        print(f"Available metadata fields to {action_label}:")
+        available_fields: List[str] = []
+        field_mapping = self._metadata_field_mapping(base_data)
+
+        for key, (name, value, _) in field_mapping.items():
+            if value:
+                available_fields.append(key)
+                preview = value[:50] + "..." if len(value) > 50 else value
+                print(f"  • {name}: {preview}")
+
+        if not available_fields:
+            print_error("No content found in base language to translate")
+            return None
+
+        print()
+        print(f"Select metadata fields to {action_label}:")
+        print("• Enter 'all' to use all available fields")
+        print("• Enter field names (comma-separated, e.g., 'whats_new,promotional_text')")
+
+        fields_input = input("Fields: ").strip()
+        if not fields_input:
+            print_warning("No fields selected")
+            return None
+
+        if fields_input.lower() == "all":
+            return available_fields
+
+        selected_fields = [field.strip() for field in fields_input.split(",") if field.strip()]
+        invalid_fields = [field for field in selected_fields if field not in available_fields]
+        if invalid_fields:
+            print_error(f"Invalid field names: {', '.join(invalid_fields)}")
+            print(f"Available fields: {', '.join(available_fields)}")
+            return None
+
+        return selected_fields
     
     def show_main_menu(self):
         """Display main menu and handle user choice."""
@@ -755,6 +1331,7 @@ class TranslateRCLI:
             return True
             
         include_app_info = translation_choice == '2'
+        metadata_only = translation_choice == '1'
         
         try:
             # Get app ID from user
@@ -796,6 +1373,13 @@ class TranslateRCLI:
             if not base_data:
                 print_error("Could not find base localization data")
                 return True
+
+            field_mapping = self._metadata_field_mapping(base_data)
+            selected_fields = list(field_mapping.keys())
+            if metadata_only:
+                selected_fields = self._select_metadata_fields(base_data, action_label="translate")
+                if not selected_fields:
+                    return True
             
             # Show available target languages
             print()
@@ -860,41 +1444,25 @@ class TranslateRCLI:
                     translated_data = {}
                     try:
                         # Translate fields
-                        if base_data.get("description"):
-                            print(f"  • Translating description...")
-                            translated_data["description"] = provider.translate(
-                                base_data["description"],
+                        for field in selected_fields:
+                            field_name, source_content, api_field_name = field_mapping[field]
+                            if not source_content:
+                                continue
+
+                            print(f"  • Translating {field_name.lower()}...")
+                            translated_content = self._translate_field_content(
+                                provider,
+                                source_content,
                                 language_name,
-                                max_length=get_field_limit("description")
+                                api_field_name,
+                                is_keywords=(field == "keywords"),
                             )
 
-                        if base_data.get("keywords"):
-                            print(f"  • Translating keywords...")
-                            translated_keywords = provider.translate(
-                                base_data["keywords"],
-                                language_name,
-                                max_length=get_field_limit("keywords"),
-                                is_keywords=True
-                            )
-                            translated_keywords = translated_keywords.strip().rstrip('.')
-                            translated_keywords = truncate_keywords(translated_keywords, 100)
-                            translated_data["keywords"] = translated_keywords
+                            if field == "keywords":
+                                translated_content = translated_content.strip().rstrip('.')
+                                translated_content = truncate_keywords(translated_content, 100)
 
-                        if base_data.get("promotionalText"):
-                            print(f"  • Translating promotional text...")
-                            translated_data["promotional_text"] = provider.translate(
-                                base_data["promotionalText"],
-                                language_name,
-                                max_length=get_field_limit("promotional_text")
-                            )
-
-                        if base_data.get("whatsNew"):
-                            print(f"  • Translating what's new...")
-                            translated_data["whats_new"] = provider.translate(
-                                base_data["whatsNew"],
-                                language_name,
-                                max_length=get_field_limit("whats_new")
-                            )
+                            translated_data[api_field_name] = translated_content
 
                         self.asc_client.create_app_store_version_localization(
                             version_id=version_id,
@@ -1153,33 +1721,33 @@ class TranslateRCLI:
             if not base_data:
                 print_error("Could not find base localization data")
                 return True
-            
+
             # Show existing localizations (excluding base language)
             existing_locales = [loc["attributes"]["locale"] for loc in localizations if loc["attributes"]["locale"] != base_locale]
-            
+
             if not existing_locales:
                 print_warning("No other localizations found to update. Use Translation Mode to add new languages.")
                 return True
-            
+
             print()
             print("Existing localizations to update:")
             for i, locale in enumerate(existing_locales, 1):
                 language_name = APP_STORE_LOCALES.get(locale, "Unknown")
                 print(f"{i:2d}. {locale} ({language_name})")
-            
+
             # Let user select which languages to update
             print()
             print("Select languages to update:")
             print("• Enter 'all' to update all languages")
             print("• Enter numbers (comma-separated, e.g., '1,3,5')")
             print("• Enter locale codes (comma-separated, e.g., 'zh-Hans,de-DE')")
-            
+
             target_input = input("Languages to update: ").strip()
-            
+
             if not target_input:
                 print_warning("No languages selected")
                 return True
-            
+
             # Parse target languages
             if target_input.lower() == 'all':
                 target_locales = existing_locales
@@ -1195,11 +1763,11 @@ class TranslateRCLI:
                 # Locale codes
                 target_locales = [locale.strip() for locale in target_input.split(",")]
                 invalid_locales = [loc for loc in target_locales if loc not in existing_locales]
-                
+
                 if invalid_locales:
                     print_error(f"Invalid or non-existing language codes: {', '.join(invalid_locales)}")
                     return True
-            
+
             if not target_locales:
                 print_warning("No valid languages selected")
                 return True
@@ -1302,13 +1870,13 @@ class TranslateRCLI:
                                 print(f"  • Translating {field_name.lower()}...")
 
                                 is_keywords = field == "keywords"
-                                max_length = get_field_limit(field.replace("_", ""))
 
-                                translated_content = provider.translate(
+                                translated_content = self._translate_field_content(
+                                    provider,
                                     source_content,
                                     language_name,
-                                    max_length=max_length,
-                                    is_keywords=is_keywords
+                                    field,
+                                    is_keywords=is_keywords,
                                 )
 
                                 if is_keywords:
@@ -1662,19 +2230,21 @@ class TranslateRCLI:
                     try:
                         if base_data.get("description"):
                             print(f"  • Translating description...")
-                            translated_data["description"] = provider.translate(
+                            translated_data["description"] = self._translate_field_content(
+                                provider,
                                 base_data["description"],
                                 language_name,
-                                max_length=get_field_limit("description")
+                                "description",
                             )
 
                         if base_data.get("keywords"):
                             print(f"  • Translating keywords...")
-                            translated_keywords = provider.translate(
+                            translated_keywords = self._translate_field_content(
+                                provider,
                                 base_data["keywords"],
                                 language_name,
-                                max_length=get_field_limit("keywords"),
-                                is_keywords=True
+                                "keywords",
+                                is_keywords=True,
                             )
                             translated_keywords = translated_keywords.strip().rstrip('.')
                             translated_keywords = truncate_keywords(translated_keywords, 100)
@@ -1682,18 +2252,20 @@ class TranslateRCLI:
 
                         if base_data.get("promotionalText"):
                             print(f"  • Translating promotional text...")
-                            translated_data["promotional_text"] = provider.translate(
+                            translated_data["promotional_text"] = self._translate_field_content(
+                                provider,
                                 base_data["promotionalText"],
                                 language_name,
-                                max_length=get_field_limit("promotional_text")
+                                "promotional_text",
                             )
 
                         if base_data.get("whatsNew"):
                             print(f"  • Translating what's new...")
-                            translated_data["whats_new"] = provider.translate(
+                            translated_data["whats_new"] = self._translate_field_content(
+                                provider,
                                 base_data["whatsNew"],
                                 language_name,
-                                max_length=get_field_limit("whats_new")
+                                "whats_new",
                             )
 
                         self.asc_client.create_app_store_version_localization(
@@ -2406,33 +2978,48 @@ class TranslateRCLI:
     def configuration_mode(self):
         """Handle configuration management."""
         print_info("Configuration Mode - Manage your settings")
-        
-        print()
-        print("Available AI Providers:")
-        providers = self.ai_manager.list_providers()
-        if providers:
-            for provider in providers:
-                print(f"✅ {provider}")
-        else:
-            print("❌ No AI providers configured")
-        
-        print()
-        print("App Store Connect:", "✅ Configured" if self.asc_client else "❌ Not configured")
-        
-        print()
-        saved_apps = self.config.load_saved_apps()
-        print(f"Saved apps: {len(saved_apps)}")
-        
-        print()
-        manage_saved = input("Do you want to manage saved apps? (y/n): ").strip().lower()
-        if manage_saved in ['y', 'yes']:
-            self._manage_saved_apps()
-        
-        print()
-        reconfigure = input("Do you want to reconfigure settings? (y/n): ").strip().lower()
-        if reconfigure in ['y', 'yes']:
-            return self.setup_wizard()
-        
+
+        while True:
+            print()
+            print("Available AI Providers:")
+            providers = self.ai_manager.list_providers()
+            current_default = self.config.get_default_ai_provider()
+            if providers:
+                for provider in providers:
+                    suffix = " (default)" if provider == current_default else ""
+                    print(f"✅ {provider}{suffix}")
+            else:
+                print("❌ No AI providers configured")
+
+            print()
+            print("App Store Connect:", "✅ Configured" if self.asc_client else "❌ Not configured")
+
+            print()
+            saved_apps = self.config.load_saved_apps()
+            print(f"Saved apps: {len(saved_apps)}")
+
+            print()
+            print("Configuration options:")
+            print("1. Configure AI providers")
+            print("2. Switch default AI provider")
+            print("3. Manage saved apps")
+            print("4. Reconfigure settings")
+            print("5. Back")
+
+            choice = input("Select option (1-5): ").strip()
+            if choice == "1":
+                self._configure_ai_providers_menu()
+            elif choice == "2":
+                self._switch_default_ai_provider()
+            elif choice == "3":
+                self._manage_saved_apps()
+            elif choice == "4":
+                return self.setup_wizard()
+            elif choice == "5":
+                break
+            else:
+                print_error("Invalid choice")
+
         return True
     
     def show_logo(self):

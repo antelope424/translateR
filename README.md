@@ -17,7 +17,7 @@ Automate App Store Connect localizations with AI translation. Transform your sin
 
 ## What It Does
 
-TranslateR connects to your App Store Connect account and translates or updates localized content with AI providers like Claude, GPT, or Gemini.
+TranslateR connects to your App Store Connect account and translates or updates localized content with AI providers like Claude, GPT, Gemini, or a local model running on your machine.
 
 **Before**: Manually translate and upload metadata for each language  
 **After**: Select languages, choose AI provider, hit enter. Done.
@@ -36,7 +36,7 @@ TranslateR connects to your App Store Connect account and translates or updates 
    python3 main.py
    ```
    - Add your App Store Connect API key (.p8 file)
-   - Add at least one AI provider API key (Claude/GPT/Gemini)
+   - Add at least one AI provider API key (Claude/GPT/Gemini) or configure a local model endpoint
 
 3. **Use**
    ```bash
@@ -56,6 +56,15 @@ TranslateR connects to your App Store Connect account and translates or updates 
 - **Claude**: [Get key](https://console.anthropic.com/) - Best translation quality (recommended)
 - **GPT**: [Get key](https://platform.openai.com/) - Most reliable
 - **Gemini**: [Get key](https://makersuite.google.com/) - Fastest
+- **Local Model**: Point TranslateR at an OpenAI-compatible local endpoint such as Ollama (`http://localhost:11434/v1`), LM Studio (`http://localhost:1234/v1`), or `llama.cpp` server mode (`http://localhost:8080`)
+
+### Local Model Notes
+- No extra Python dependencies are required
+- The local server must expose an OpenAI-compatible `chat/completions` endpoint
+- API key is optional and only needed if your local server requires one
+- Recommended starter model for translation: `gemma4`
+- `config/providers.json` now includes `local.max_output_tokens` so you can raise the client-side completion cap for long descriptions
+- Long `description` and `what's new` fields are chunked automatically for local models when needed
 
 ## Main Workflows
 
@@ -209,8 +218,8 @@ Translating Spanish... ✓
 
 After first run, config files are created in `config/`:
 
-**`api_keys.json`** - Your API keys and credentials  
-**`providers.json`** - AI provider settings  
+**`api_keys.json`** - Your API keys and credentials, or optional local endpoint token
+**`providers.json`** - AI provider settings, including local model endpoint, default model, and local output token cap  
 **`instructions.txt`** - Translation guidelines for AI
 **`saved_apps.json`** - Saved app IDs and labels
 
@@ -261,10 +270,14 @@ Verwandeln Sie Ihre Ideen in schöne Apps
 → Check your .p8 file path and API credentials
 
 **Error: "No AI providers configured"**  
-→ Add at least one valid AI provider API key
+→ Add at least one valid AI provider API key (Claude/GPT/Gemini) or enable the local model provider in `config/providers.json`
 
 **Error: "Translation failed"**  
 → Check API quotas/limits, try different provider
+
+**Error: "Local model translation failed"**  
+→ Confirm your local server is running and the configured `base_url` exposes `/v1/chat/completions`
+→ If long descriptions stop early, increase `local.max_output_tokens` in `config/providers.json`
 
 ## Contributing
 

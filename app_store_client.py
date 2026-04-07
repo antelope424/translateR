@@ -13,7 +13,7 @@ import random
 import re
 import unicodedata
 
-from utils import get_field_limit
+from utils import get_field_limit, truncate_keywords
 
 
 
@@ -45,6 +45,21 @@ def _strip_control_chars(text: str) -> str:
         # Skip: other symbols (arrows, emoji, math), other control/format chars
     cleaned = re.sub(r'\s+', ' ', ''.join(result)).strip()
     return cleaned
+
+
+def _truncate_metadata_field(text: Optional[str], field_name: str) -> Optional[str]:
+    """Trim localized metadata fields to Apple's hard character limits."""
+    if text is None:
+        return None
+
+    limit = get_field_limit(field_name)
+    if not limit or len(text) <= limit:
+        return text
+
+    if field_name == "keywords":
+        return truncate_keywords(text, limit)
+
+    return text[:limit]
 
 
 
@@ -181,6 +196,11 @@ class AppStoreConnectClient:
             promotional_text: Promotional text (max 170 chars)
             whats_new: What's new text (max 4000 chars)
         """
+        description = _truncate_metadata_field(description, "description") or ""
+        keywords = _truncate_metadata_field(keywords, "keywords")
+        promotional_text = _truncate_metadata_field(promotional_text, "promotional_text")
+        whats_new = _truncate_metadata_field(whats_new, "whats_new")
+
         data = {
             "data": {
                 "type": "appStoreVersionLocalizations",
@@ -225,6 +245,11 @@ class AppStoreConnectClient:
             promotional_text: Promotional text (max 170 chars)
             whats_new: What's new text (max 4000 chars)
         """
+        description = _truncate_metadata_field(description, "description")
+        keywords = _truncate_metadata_field(keywords, "keywords")
+        promotional_text = _truncate_metadata_field(promotional_text, "promotional_text")
+        whats_new = _truncate_metadata_field(whats_new, "whats_new")
+
         # First get current localization to check for changes
         try:
             current = self.get_app_store_version_localization(localization_id)
@@ -243,9 +268,6 @@ class AppStoreConnectClient:
                 attributes["promotionalText"] = promotional_text
             
             if whats_new is not None and whats_new != current_attrs.get("whatsNew"):
-                # Ensure what's new doesn't exceed character limit
-                if len(whats_new) > 4000:
-                    whats_new = whats_new[:3997] + "..."
                 attributes["whatsNew"] = whats_new
             
             # Only make request if there are changes
@@ -279,8 +301,6 @@ class AppStoreConnectClient:
             if promotional_text is not None:
                 attributes["promotionalText"] = promotional_text
             if whats_new is not None:
-                if len(whats_new) > 4000:
-                    whats_new = whats_new[:3997] + "..."
                 attributes["whatsNew"] = whats_new
             
             return self._request("PATCH", f"appStoreVersionLocalizations/{localization_id}", data=data)

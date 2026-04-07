@@ -33,6 +33,79 @@ def _extract_error_message(response: requests.Response) -> str:
     return text[:400] if text else f"HTTP {response.status_code}"
 
 
+def _build_translation_instruction(
+    target_language: str,
+    max_length: Optional[int] = None,
+    is_keywords: bool = False,
+    refinement: Optional[str] = None,
+) -> str:
+    """Build shared translation instructions for provider prompts."""
+    instruction = (
+        f"You are a professional translator specializing in App Store metadata translation. "
+        f"Translate the following text to {target_language}. "
+        f"Maintain the marketing tone and style of the original text. "
+        f"Translate the complete text faithfully. Do not summarize, omit sections, or rewrite "
+        f"the text into a shorter overview unless a strict character limit makes that necessary. "
+        f"Preserve paragraph breaks, bullet structure, and calls to action where possible. "
+        f"Give direct translation in the target language only. Do not give multiple options; "
+        f"give your best result."
+    )
+
+    if is_keywords:
+        instruction += " For keywords, provide a comma-separated list and keep it concise."
+
+    if refinement:
+        instruction += f" Additional guidance: {refinement}"
+
+    if max_length:
+        instruction += (
+            f" CRITICAL: Your translation MUST be EXACTLY {max_length} characters or fewer "
+            f"INCLUDING ALL SPACES, PUNCTUATION, AND SPECIAL CHARACTERS. Count every single "
+            f"character including spaces between words. Do not add ellipsis (...) at the end. "
+            f"Create a concise but meaningful translation that captures the essence of the "
+            f"original message while staying within the character limit."
+        )
+
+    return instruction
+
+
+def _extract_chat_completion_text(response_data: Dict[str, Any]) -> str:
+    """Extract content from OpenAI-compatible chat completions payloads."""
+    if "choices" not in response_data or not response_data["choices"]:
+        raise ValueError("Unexpected Chat Completions API format")
+
+    message = response_data["choices"][0].get("message", {})
+    content = message.get("content")
+
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text" and item.get("text"):
+                parts.append(str(item["text"]))
+        if parts:
+            return "".join(parts)
+
+    raise ValueError("Unexpected Chat Completions API format")
+
+
+def _extract_chat_completion_finish_reason(response_data: Dict[str, Any]) -> Optional[str]:
+    """Extract finish reason from OpenAI-compatible chat completions payloads."""
+    if "choices" not in response_data or not response_data["choices"]:
+        return None
+
+    choice = response_data["choices"][0]
+    if not isinstance(choice, dict):
+        return None
+
+    finish_reason = choice.get("finish_reason") or choice.get("stop_reason")
+    return str(finish_reason) if finish_reason else None
+
+
 class AIProvider(ABC):
     """Abstract base class for AI translation providers."""
     
@@ -91,26 +164,12 @@ class AnthropicProvider(AIProvider):
             }
             
             # Build system message
-            system_message = (
-                f"You are a professional translator specializing in App Store metadata translation. "
-                f"Translate the following text to {target_language}. "
-                f"Maintain the marketing tone and style of the original text."
+            system_message = _build_translation_instruction(
+                target_language=target_language,
+                max_length=max_length,
+                is_keywords=is_keywords,
+                refinement=refinement,
             )
-            
-            if is_keywords:
-                system_message += " For keywords, provide a comma-separated list and keep it concise."
-
-            if refinement:
-                system_message += f" Additional guidance: {refinement}"
-            
-            if max_length:
-                system_message += (
-                    f" CRITICAL: Your translation MUST be EXACTLY {max_length} characters or fewer "
-                    f"INCLUDING ALL SPACES, PUNCTUATION, AND SPECIAL CHARACTERS. Count every single "
-                    f"character including spaces between words. Do not add ellipsis (...) at the end. "
-                    f"Create a concise but meaningful translation that captures the essence of the "
-                    f"original message while staying within the character limit."
-                )
             
             data = {
                 "model": self.model,
@@ -226,10 +285,7 @@ class OpenAIProvider(AIProvider):
 
             raise ValueError("Unexpected Responses API format")
 
-        if "choices" in response_data and len(response_data["choices"]) > 0:
-            return response_data["choices"][0]["message"]["content"]
-
-        raise ValueError("Unexpected Chat Completions API format")
+        return _extract_chat_completion_text(response_data)
     
     def translate(self, text: str, target_language: str, 
                   max_length: Optional[int] = None, 
@@ -254,26 +310,12 @@ class OpenAIProvider(AIProvider):
             }
             
             # Build system message
-            system_message = (
-                f"You are a professional translator specializing in App Store metadata translation. "
-                f"Translate the following text to {target_language}. "
-                f"Maintain the marketing tone and style of the original text."
+            system_message = _build_translation_instruction(
+                target_language=target_language,
+                max_length=max_length,
+                is_keywords=is_keywords,
+                refinement=refinement,
             )
-            
-            if is_keywords:
-                system_message += " For keywords, provide a comma-separated list and keep it concise."
-
-            if refinement:
-                system_message += f" Additional guidance: {refinement}"
-            
-            if max_length:
-                system_message += (
-                    f" CRITICAL: Your translation MUST be EXACTLY {max_length} characters or fewer "
-                    f"INCLUDING ALL SPACES, PUNCTUATION, AND SPECIAL CHARACTERS. Count every single "
-                    f"character including spaces between words. Do not add ellipsis (...) at the end. "
-                    f"Create a concise but meaningful translation that captures the essence of the "
-                    f"original message while staying within the character limit."
-                )
             
             data = self._build_request_payload(system_message, text)
             
@@ -361,27 +403,13 @@ class GoogleGeminiProvider(AIProvider):
         
         try:
             # Build prompt
-            prompt = (
-                f"You are a professional translator specializing in App Store metadata translation. "
-                f"Translate the following text to {target_language}. "
-                f"Maintain the marketing tone and style of the original text."
+            prompt = _build_translation_instruction(
+                target_language=target_language,
+                max_length=max_length,
+                is_keywords=is_keywords,
+                refinement=refinement,
             )
-            
-            if is_keywords:
-                prompt += " For keywords, provide a comma-separated list and keep it concise."
 
-            if refinement:
-                prompt += f" Additional guidance: {refinement}"
-            
-            if max_length:
-                prompt += (
-                    f" CRITICAL: Your translation MUST be EXACTLY {max_length} characters or fewer "
-                    f"INCLUDING ALL SPACES, PUNCTUATION, AND SPECIAL CHARACTERS. Count every single "
-                    f"character including spaces between words. Do not add ellipsis (...) at the end. "
-                    f"Create a concise but meaningful translation that captures the essence of the "
-                    f"original message while staying within the character limit."
-                )
-            
             prompt += f"\n\nText to translate: {text}"
             
             data = {
@@ -539,6 +567,138 @@ class OpenRouterProvider(AIProvider):
     
     def get_name(self) -> str:
         return "OpenRouter"
+
+
+class LocalModelProvider(AIProvider):
+    """Local OpenAI-compatible model provider."""
+
+    def __init__(
+        self,
+        model: str,
+        base_url: str,
+        api_key: Optional[str] = None,
+        max_output_tokens: int = 8000,
+    ):
+        self.model = model
+        self.base_url = (base_url or "").strip()
+        self.api_key = (api_key or "").strip()
+        self.max_output_tokens = max(1, int(max_output_tokens))
+
+    def _chat_completions_url(self) -> str:
+        """Normalize local endpoint to a chat completions URL."""
+        base = self.base_url.rstrip("/")
+        if base.endswith("/chat/completions"):
+            return base
+        if base.endswith("/v1"):
+            return f"{base}/chat/completions"
+        return f"{base}/v1/chat/completions"
+
+    def _headers(self) -> Dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        return headers
+
+    def _request_payload(
+        self,
+        system_message: str,
+        text: str,
+        max_tokens: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        return {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": text},
+            ],
+            "temperature": 0.3,
+            "max_tokens": max_tokens or self.max_output_tokens,
+            "stream": False,
+        }
+
+    def translate(
+        self,
+        text: str,
+        target_language: str,
+        max_length: Optional[int] = None,
+        is_keywords: bool = False,
+        seed: Optional[int] = None,
+        refinement: Optional[str] = None,
+    ) -> str:
+        """Translate using a local OpenAI-compatible model endpoint."""
+        provider_label = "Local Model"
+
+        log_ai_request(provider_label, self.model, text, target_language, max_length, is_keywords)
+
+        try:
+            system_message = _build_translation_instruction(
+                target_language=target_language,
+                max_length=max_length,
+                is_keywords=is_keywords,
+                refinement=refinement,
+            )
+            requested_max_tokens = self.max_output_tokens
+            data = self._request_payload(system_message, text, max_tokens=requested_max_tokens)
+
+            if seed is not None:
+                data["seed"] = seed
+
+            response = requests.post(
+                self._chat_completions_url(),
+                headers=self._headers(),
+                json=data,
+                timeout=1800,
+            )
+            if not response.ok:
+                message = _extract_error_message(response)
+                raise ValueError(f"Local model API error ({response.status_code}): {message}")
+
+            response_data = response.json()
+            translated_text = _extract_chat_completion_text(response_data)
+            finish_reason = _extract_chat_completion_finish_reason(response_data)
+            if finish_reason and finish_reason.lower() in {"length", "max_tokens"}:
+                raise ValueError(
+                    "Local model response was truncated because it hit the configured "
+                    f"max output tokens ({requested_max_tokens})."
+                )
+
+            if max_length and len(translated_text) > max_length:
+                log_character_limit_retry(provider_label, len(translated_text), max_length)
+                system_message += (
+                    f" The text MUST be under {max_length} characters INCLUDING SPACES AND "
+                    f"PUNCTUATION. Count every character. Prioritize brevity."
+                )
+                data = self._request_payload(system_message, text, max_tokens=requested_max_tokens)
+                if seed is not None:
+                    data["seed"] = seed
+
+                response = requests.post(
+                    self._chat_completions_url(),
+                    headers=self._headers(),
+                    json=data,
+                    timeout=1800,
+                )
+                if not response.ok:
+                    message = _extract_error_message(response)
+                    raise ValueError(f"Local model API error ({response.status_code}): {message}")
+                response_data = response.json()
+                translated_text = _extract_chat_completion_text(response_data)
+                finish_reason = _extract_chat_completion_finish_reason(response_data)
+                if finish_reason and finish_reason.lower() in {"length", "max_tokens"}:
+                    raise ValueError(
+                        "Local model response was truncated because it hit the configured "
+                        f"max output tokens ({requested_max_tokens})."
+                    )
+
+            log_ai_response(provider_label, translated_text, success=True)
+            return translated_text.strip()
+
+        except Exception as e:
+            log_ai_response(provider_label, "", success=False, error=str(e))
+            raise Exception(f"Local model translation failed: {str(e)}")
+
+    def get_name(self) -> str:
+        return "Local Model"
 
 
 class AIProviderManager:
